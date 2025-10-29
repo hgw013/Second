@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JS 데이터 → HTML 테이블 변환기 (다중 테이블)</title>
+  <link rel="stylesheet" href="css/app.css?v=20251023" />
+  <style>
+    /* 공통 탭 스타일 */
+    .view-tabs{display:flex;gap:6px;border-bottom:1px solid var(--border);margin:6px 0 12px}
+    .view-tab{display:inline-block;padding:8px 12px;border:1px solid var(--border);border-bottom:none;border-radius:10px 10px 0 0;background:var(--card);text-decoration:none;color:inherit}
+    .view-tab.is-active{background:var(--thead);border-color:var(--accent);font-weight:600}
+
+    /* 컨트롤바: 좌측 정렬로 '딱 붙게' */
+    .controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+    .left-group,.right-group{display:flex;flex-wrap:wrap;align-items:center;gap:6px;flex:0 0 auto}
+    .right-group{margin-left:0}
+
+    /* 시트 탭 */
+    .tabs{display:flex;flex-wrap:wrap;gap:.5rem;margin:.5rem 0 1rem}
+    .tab{border:1px solid var(--border);padding:.25rem .6rem;border-radius:.5rem;cursor:pointer;background:var(--card)}
+    .tab.active{background:var(--thead);border-color:var(--accent)}
+
+    /* 입력창 */
+    #input{width:100%;min-height:260px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
+
+</head>
+<body class="container">
+  <div class="panel">
+    <div class="paneltitle">JS 데이터 → HTML 테이블 변환기 <span class="hint">(다중 테이블)</span></div>
+    <p class="hint" style="margin-top:-2px">
+      제목 라인+구분선(——)으로 섹션이 나뉜 텍스트에서도, 각 섹션별 JSON을 자동 인식해 여러 개의 테이블로 변환합니다.
+    </p>
+
+    <!-- 탭 네비 -->
+<nav class="view-tabs">
+  <a class="view-tab" href="js-table-converter.html">단일 변환기</a>
+  <a class="view-tab is-active" href="js-table-converter-multi.html">다중 테이블</a>
+  <!-- 추가 -->
+  <a class="view-tab" href="js-table-column-split.html">컬럼명 분할</a>
+</nav>
+
+    <!-- 입력 -->
+    <textarea id="input" placeholder="여기에 JSON 또는 섹션형 텍스트를 붙여넣으세요."></textarea>
+    <p class="small" style="margin-top:8px">생성일시: <span id="ts"></span></p>
+
+    <!-- 컨트롤 (단일과 동일 규격) -->
+    <div class="controls">
+      <div class="left-group">
+        <button id="btnSample" class="btn">샘플 채우기</button>
+        <button id="btnClear" class="btn">지우기</button>
+        <div class="flex gap">
+          <input id="q" type="text" placeholder="검색 (전체 텍스트 포함)">
+        </div>
+      </div>
+    <div class="right-group">
+      <button id="btnConvert" class="btn btn-primary">테이블 만들기</button>
+      <button id="btnCsv" class="btn">CSV 내보내기</button>
+      <!-- 추가: 일괄 다운로드 -->
+      <button id="btnBulk" class="btn">일괄 다운로드</button>
+    </div>
+
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <!-- 포맷 안내 -->
+    <div class="hint" style="margin:.25rem 0 .75rem">
+      • 섹션 제목은 <code>제목 --------------------</code> 같은 한 줄 패턴을 인식합니다(긴 제목은 자동 축약).<br/>
+      • 각 섹션에서 처음 등장하는 <code>[</code> 또는 <code>{</code>…<code>]</code>/<code>}</code> 블록을 JSON으로 파싱합니다.
+    </div>
+
+    <!-- 시트 탭 + 테이블 뷰 -->
+    <div id="tabs" class="tabs" style="display:none"></div>
+    <div class="table-wrap" style="margin-top:10px">
+      <table id="tbl" class="tbl">
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div style="height:12px"></div>
+    <a class="btn-fill" href="https://hgw.dothome.co.kr/">뒤로가기</a>
+  </div>
+
+<script>
+function goBackOrHome(){ location.href='https://hgw.dothome.co.kr/'; } // 더는 사용하지 않아도 무방
+
+(function(){
+  const elIn = document.getElementById('input');
+  const elTabs = document.getElementById('tabs');
+  const elTblHead = document.querySelector('#tbl thead');
+  const elTblBody = document.querySelector('#tbl tbody');
+  const elQ = document.getElementById('q');
+  const elTs = document.getElementById('ts');
+  const elStatus = document.getElementById('status');
+
+  // 상태: 시트별 독립 정렬/필터 유지
+  let sheets = []; // [{ title, rows, columns, sort:{key,dir}, filterText }]
+  let active = 0;
+
+
+// JSON 블록을 모두 추출 (문자열/이스케이프 안전, 중첩 괄호 카운팅)
+function extractAllJsonBlocks(text){
+  const blocks=[];
+  const n=text.length;
+  let i=0, inStr=false, esc=false;
+
+  while(i<n){
+    // 다음 여는 괄호 탐색
+    let s=-1, openCh='', closeCh='';
+    for(let k=i;k<n;k++){
+      const ch=text[k];
+      if (inStr){
+        if (esc) { esc=false; }
+        else if (ch==='\\') { esc=true; }
+        else if (ch==='"') { inStr=false; }
+        continue;
+      }
+      if (ch==='"'){ inStr=true; continue; }
+      if (ch==='[' || ch==='{'){
+        s=k; openCh=ch; closeCh=(ch==='['?']':'}'); break;
+      }
+    }
+    if (s<0) break;
+
+    // 해당 괄호 쌍의 끝까지 이동
+    let depth=0; inStr=false; esc=false;
+    for(let k=s;k<n;k++){
+      const ch=text[k];
+      if (inStr){
+        if (esc) { esc=false; }
+        else if (ch==='\\') { esc=true; }
+        else if (ch==='"') { inStr=false; }
+        continue;
+      }
+      if (ch==='"'){ inStr=true; continue; }
+
+      if (ch===openCh) depth++;
+      else if (ch===closeCh){
+        depth--;
+        if (depth===0){
+          const json=text.slice(s, k+1);
+          blocks.push({ json, start:s, end:k+1 });
+          i=k+1; // 다음 탐색 시작점
+          break;
+        }
+      }
+      if (k===n-1){ i=n; } // 비정상 종료 예방
+    }
+  }
+  return blocks;
+}
+
+// 제목 정리: 줄 끝 장식(---, ----, ===, ___ 등)과 콜론 제거
+function cleanTitle(s){
+  if (!s) return '';
+  s = s.trim();
+  // 라인 끝 장식 제거(하이픈/대시/언더스코어/등호/물결 등 2개 이상 반복)
+  s = s.replace(/\s*[-–—_=~·•‒―┄┅━]{2,}\s*$/u, '');
+  // 마지막 콜론/세퍼레이터 제거
+  s = s.replace(/\s*[:|\-]+$/u, '');
+  return s.trim();
+}
+
+// JSON 블록 시작점 바로 위의 가장 가까운 '비어있지 않은' 텍스트 줄을 제목으로
+function inferTitleBefore(text, startIdx){
+  const upTo = text.slice(0, startIdx);
+  const lines = upTo.split('\n');
+  for (let i=lines.length-1; i>=0; i--){
+    const raw = (lines[i]||'').trim();
+    if (!raw) continue;
+    return cleanTitle(raw);
+  }
+  return '';
+}
+
+  // --- 공통 유틸 (단일과 동일) ---
+  const ZW = /\u200B|\u200C|\u200D|\uFEFF/g;
+  function sanitize(s){
+    return (s||'').replace(/\r\n?|\r/g,'\n').replace(ZW,'').replace(/[“”]/g,'"').replace(/[‘’]/g,"'");
+  }
+  function tryJSON(s){ try{ return JSON.parse(s); } catch(e){ return null; } }
+
+  function flattenRow(obj, prefix = '', out = {}){
+    if (obj === null || obj === undefined) return out;
+    if (Array.isArray(obj)) { out[prefix || '[]'] = JSON.stringify(obj); return out; }
+    if (typeof obj === 'object'){
+      for (const [k,v] of Object.entries(obj)){
+        const key = prefix ? prefix + '.' + k : k;
+        if (v && typeof v === 'object' && !Array.isArray(v)) flattenRow(v, key, out);
+        else out[key] = v;
+      }
+      return out;
+    }
+    out[prefix || 'value'] = obj; return out;
+  }
+  function toRows(data){
+    if (Array.isArray(data)) return data.map(r => flattenRow(r));
+    if (data && typeof data === 'object') return [flattenRow(data)];
+    return [];
+  }
+  function uniqueHeaders(rows){
+    const set = new Set(); rows.forEach(r=>Object.keys(r).forEach(k=>set.add(k))); return Array.from(set);
+  }
+
+  // 파일명 정리
+function sanitizeFileName(s){
+  return (s||'sheet')
+    .replace(/[\\/:*?"<>|]+/g,'')
+    .replace(/\s+/g,'_')
+    .slice(0,80);
+}
+
+// 시트 -> CSV 문자열 (단일/CSV 내보내기와 동일 규칙)
+function csvStringFromSheet(S){
+  const q=(S.filterText||'').trim().toLowerCase();
+  const rowsView = q ? S.rows.filter(r=>JSON.stringify(r).toLowerCase().includes(q)) : S.rows.slice();
+
+  const isIsoDateLike = s => (typeof s==="string") && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s);
+  const isNumeric = v => typeof v==='number' || (typeof v==='string' && v.trim()!=='' && isFinite(Number(v)));
+  const isDateColumn = col => (col||'').toLowerCase().includes('dt') || (col||'').toLowerCase().includes('date');
+  const RATE_HINTS=["rate","commission.parsedValue","_rate","discount"];
+  const fmtDate = s => { try{ const d=new Date(s); if(isNaN(d)) return s; const pad=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}` }catch{return s} };
+  const fmtNum = v => { const n=Number(v); return isFinite(n) ? n.toLocaleString('ko-KR') : (v ?? ''); };
+  const formatForDisplay = (col,v)=>{
+    if(isDateColumn(col)){
+      const sv=String(v??'');
+      if(/^\d{8}$/.test(sv)) return `${sv.slice(0,4)}-${sv.slice(4,6)}-${sv.slice(6,8)}`;
+      if(/^\d{6}$/.test(sv)) return `${sv.slice(0,4)}-${sv.slice(4,6)}`;
+      return fmtDate(v);
+    }
+    if(isIsoDateLike(v)) return fmtDate(v);
+    if(isNumeric(v) && !RATE_HINTS.some(h => (col||'').includes(h))) return fmtNum(v);
+    return v==null? '' : String(v);
+  };
+
+  const esc = s => { if (s==null) return ""; s=String(s); return (s.includes('"')||s.includes(",")||s.includes("\n")) ? '"' + s.replace(/"/g,'""') + '"' : s; };
+
+  // 합계
+  const sums = {}; S.columns.forEach(c => sums[c]=0);
+  rowsView.forEach(r=>{
+    S.columns.forEach(col=>{
+      const v=r[col];
+      if(!isDateColumn(col) && isNumeric(v) && !RATE_HINTS.some(h=>(col||'').includes(h))) sums[col]+=Number(v);
+    });
+  });
+
+  const header = ["", ...S.columns].map(esc).join(",");
+  const lines = rowsView.map(r => ["", ...S.columns.map(c => esc(formatForDisplay(c, r[c])) )].join(","));
+  const totalLine = ["합계", ...S.columns.map(col => {
+    const v = sums[col]; return (isFinite(v) && v !== 0) ? esc(v.toLocaleString("ko-KR")) : "";
+  })].join(",");
+
+  return "\uFEFF" + [header, ...lines, totalLine].join("\n"); // BOM 포함(엑셀 호환)
+}
+
+function downloadBlob(data, filename, mime){
+  const blob = new Blob([data], {type: mime || 'application/octet-stream'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+}
+
+// 일괄 다운로드 (JSZip 있으면 zip, 없으면 개별 파일 연속 다운로드)
+function bulkDownloadAll(){
+  if (!sheets.length){
+    alert('다운로드할 시트가 없습니다. 먼저 변환하세요.');
+    return;
+  }
+  // 파일명 접두사(타임스탬프)
+  const stamp = new Date().toISOString().slice(0,19).replace(/[-:T]/g,'');
+
+  if (window.JSZip){
+    const zip = new JSZip();
+    sheets.forEach((S, idx)=>{
+      const csv = csvStringFromSheet(S);
+      const name = sanitizeFileName(shortTitle(S.title) || `sheet${idx+1}`) + '.csv';
+      zip.file(name, csv); // 문자열로 추가(BOM 포함)
+    });
+    zip.generateAsync({type:'blob'}).then(blob=>{
+      downloadBlob(blob, `tables_${stamp}.zip`, 'application/zip');
+    }).catch(err=>{
+      console.error(err);
+      // 실패 시 폴백: 개별 다운로드
+      sheets.forEach((S, idx)=>{
+        const csv = csvStringFromSheet(S);
+        const name = sanitizeFileName(shortTitle(S.title) || `sheet${idx+1}`) + '.csv';
+        setTimeout(()=>downloadBlob(csv, name, 'text/csv;charset=utf-8;'), idx*80);
+      });
+    });
+  } else {
+    // 폴백: 개별 파일 연속 다운로드 (브라우저가 여러 파일 다운로드 허용해야 함)
+    sheets.forEach((S, idx)=>{
+      const csv = csvStringFromSheet(S);
+      const name = sanitizeFileName(shortTitle(S.title) || `sheet${idx+1}`) + '.csv';
+      setTimeout(()=>downloadBlob(csv, name, 'text/csv;charset=utf-8;'), idx*80);
+    });
+  }
+}
+
+// 이벤트 바인딩 추가
+document.getElementById('btnBulk').addEventListener('click', bulkDownloadAll);
+
+
+  // 표시 포맷 (단일과 동일)
+  function isIsoDateLike(s){ return (typeof s==="string") && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s); }
+  function fmtDate(s){ try{ const d=new Date(s); if(isNaN(d)) return s; const pad=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}` }catch{return s} }
+  function fmtNum(v){ const n=Number(v); if(!isFinite(n)) return v ?? ''; return n.toLocaleString('ko-KR'); }
+  function isNumeric(v){ return typeof v==='number' || (typeof v==='string' && v.trim()!=='' && isFinite(Number(v))); }
+  function isDateColumn(col){ const s=(col||'').toLowerCase(); return s.includes('dt')||s.includes('date'); }
+  const RATE_HINTS=["rate","commission.parsedValue","_rate","discount"];
+  function formatForDisplay(col,v){
+    if(isDateColumn(col)){
+      const sv=String(v??'');
+      if(/^\d{8}$/.test(sv)) return `${sv.slice(0,4)}-${sv.slice(4,6)}-${sv.slice(6,8)}`;
+      if(/^\d{6}$/.test(sv)) return `${sv.slice(0,4)}-${sv.slice(4,6)}`;
+      return fmtDate(v);
+    }
+    if(isIsoDateLike(v)) return fmtDate(v);
+    if(isNumeric(v) && !RATE_HINTS.some(h => (col||'').includes(h))) return fmtNum(v);
+    return v==null? '' : String(v);
+  }
+
+  const PREFERRED=[
+    'order_created_at','shipped_at','standard_date_time','order_number','product_name',
+    'product_price.parsedValue','product_quantity','product_option_price.parsedValue',
+    'artist_bundle_discount_amount','artist_coupon','instant_discount_amount','item_amount',
+    'idus_commission.parsedValue','total_idus_commission.parsedValue',
+    'idus_commission_amount','total_idus_commission_amount',
+    'payment_method','pg_commission_discount','pg_commission_discount_amount',
+    'total_commission_amount','commission_vat','artist_amount','supply_amount','artist_vat'
+  ];
+  function buildColumns(rows){
+    const set=new Set(); rows.forEach(r=>Object.keys(r).forEach(k=>set.add(k)));
+    const all=Array.from(set);
+    const prefer=PREFERRED.filter(k=>set.has(k));
+    const rest=all.filter(k=>!prefer.includes(k)).sort((a,b)=>a.localeCompare(b));
+    return [...prefer,...rest];
+  }
+
+  // --- 렌더링 ---
+  function renderActive(){
+    if (!sheets.length) { elTblHead.innerHTML=''; elTblBody.innerHTML=''; return; }
+    const S=sheets[active];
+    const q=(S.filterText||'').trim().toLowerCase();
+    const rowsView = q ? S.rows.filter(r=>JSON.stringify(r).toLowerCase().includes(q)) : S.rows.slice();
+
+    if (S.sort && S.sort.key){
+      rowsView.sort((a,b)=>{
+        const key=S.sort.key, dir=S.sort.dir||1;
+        const na=isNumeric(a[key])?Number(a[key]):NaN, nb=isNumeric(b[key])?Number(b[key]):NaN;
+        if(!isNaN(na)&&!isNaN(nb)) return dir*(na-nb);
+        const sa=(a[key]??'').toString(), sb=(b[key]??'').toString();
+        return dir*sa.localeCompare(sb,'ko');
+      });
+    }
+
+    // 헤더
+    elTblHead.innerHTML='';
+    const trh=document.createElement('tr');
+    const thA=document.createElement('th'); thA.textContent='합계'; trh.appendChild(thA);
+    S.columns.forEach(col=>{
+      const th=document.createElement('th'); th.textContent=col; th.dataset.key=col;
+      if (S.sort && S.sort.key===col) th.classList.add(S.sort.dir===1?'sort-asc':'sort-desc');
+      th.onclick=()=>{ if(!S.sort) S.sort={key:col,dir:1}; else if(S.sort.key===col) S.sort.dir*=-1; else S.sort={key:col,dir:1}; renderActive(); };
+      trh.appendChild(th);
+    });
+    elTblHead.appendChild(trh);
+
+    // 바디
+    elTblBody.innerHTML='';
+    const frag=document.createDocumentFragment();
+    rowsView.forEach(r=>{
+      const tr=document.createElement('tr');
+      tr.appendChild(document.createElement('td'));
+      S.columns.forEach(col=>{
+        const td=document.createElement('td');
+        td.textContent = formatForDisplay(col, r[col]);
+        tr.appendChild(td);
+      });
+      frag.appendChild(tr);
+    });
+
+    // 합계 행
+    const sums={}; S.columns.forEach(c=>sums[c]=0);
+    rowsView.forEach(r=>{
+      S.columns.forEach(col=>{
+        const v=r[col];
+        if(!isDateColumn(col) && isNumeric(v) && !RATE_HINTS.some(h=>(col||'').includes(h))) sums[col]+=Number(v);
+      });
+    });
+    const totalTr=document.createElement('tr'); totalTr.className='total-row';
+    const tf=document.createElement('td'); tf.textContent='합계'; totalTr.appendChild(tf);
+    S.columns.forEach(col=>{
+      const td=document.createElement('td');
+      const v=sums[col]; td.textContent=(isFinite(v)&&v!==0)? v.toLocaleString('ko-KR'):''; totalTr.appendChild(td);
+    });
+
+    elTblBody.appendChild(frag);
+    elTblBody.appendChild(totalTr);
+
+    if (elTs) elTs.textContent=new Date().toLocaleString('ko-KR');
+  }
+
+  function buildTabs(){
+    elTabs.innerHTML='';
+    if (!sheets.length){ elTabs.style.display='none'; return; }
+    elTabs.style.display='flex';
+    sheets.forEach((s,idx)=>{
+      const b=document.createElement('button'); b.className='tab'; b.textContent=shortTitle(s.title)||(`시트 ${idx+1}`);
+      if (idx===active) b.classList.add('active');
+      b.onclick=()=>{ active=idx; buildTabs(); renderActive(); };
+      elTabs.appendChild(b);
+    });
+  }
+
+  function shortTitle(s){ s=(s||'').trim(); return s.length>24? (s.slice(0,22)+'…'): s; }
+
+  // --- 입력 파싱 ---
+  function extractFirstJsonBlock(text, startPos){
+    const n=text.length; let s=-1, openCh='', closeCh='';
+    for(let i=startPos;i<n;i++){ const ch=text[i]; if(ch==='['||ch==='{'){ s=i; openCh=ch; closeCh=(ch==='[')?']':'}'; break; } }
+    if(s<0) return null; let depth=0, inStr=false, esc=false;
+    for(let i=s;i<n;i++){
+      const ch=text[i];
+      if(inStr){ if(esc){esc=false;} else if(ch==='\\'){esc=true;} else if(ch==='"'){inStr=false;} continue; }
+      if(ch==='"'){ inStr=true; continue; }
+      if(ch===openCh) depth++; else if(ch===closeCh){ depth--; if(depth===0){ const slice=text.slice(s,i+1); return {json:slice,start:s,end:i+1}; } }
+    }
+    return null;
+  }
+  function findTitleLineIndexes(lines){
+    const idxs=[]; for(let i=0;i<lines.length;i++){
+      if(/\S/.test(lines[i]) && /-{6,}\s*$/.test(lines[i])){
+        const m=lines[i].match(/^(.*?)\s*-{6,}\s*$/);
+        const title=(m&&m[1]?m[1]:lines[i]).trim();
+        if(title) idxs.push({i,title});
+      }
+    } return idxs;
+  }
+  function parseMulti(input){
+    const src=sanitize(input); const lines=src.split('\n'); const titles=findTitleLineIndexes(lines); if(!titles.length) return null;
+    const blocks=[];
+    for(let k=0;k<titles.length;k++){
+      const fromLine=titles[k].i+1;
+      const toLine=(k+1<titles.length?titles[k+1].i:lines.length-1);
+      const slice=lines.slice(fromLine,toLine+1).join('\n');
+      const found=extractFirstJsonBlock(slice,0);
+      if(found){
+        const data=tryJSON(found.json);
+        if (data!==null) blocks.push({title:titles[k].title, data});
+      }
+    }
+    return blocks.length? blocks: null;
+  }
+
+// 대괄호/중괄호 기반 → 위줄 텍스트를 탭명으로
+function parseByBrackets(input){
+  const src = sanitize(input);
+  const blocks = extractAllJsonBlocks(src);
+  if (!blocks.length) return null;
+
+  const out = [];
+  for (const b of blocks){
+    const data = tryJSON(b.json);
+    if (data === null) continue;
+    const t = cleanTitle(inferTitleBefore(src, b.start)) || `Sheet ${out.length+1}`;
+    out.push({ title: t, data });
+  }
+  return out.length ? out : null;
+}
+
+
+  // --- 액션 ---
+  function convert(){
+    elStatus.textContent=''; sheets=[]; active=0; buildTabs(); renderActive();
+    const src=sanitize(elIn.value);
+
+    const once = tryJSON(src);
+let blocks = null;
+
+if (once !== null){
+  blocks = [{ title: 'Sheet 1', data: once }];
+} else {
+  // 1순위: 블록 스캔 + 윗줄 제목
+  blocks = parseByBrackets(src)
+        // 2순위: (레거시) 하이픈 구분 제목 파서
+        || parseMulti(src);
+}
+
+if (!blocks || !blocks.length){
+  elStatus.textContent = '오류: 입력 파싱 실패 (JSON 또는 섹션형 포맷)';
+  return;
+}
+
+sheets = blocks.map(b=>{
+  const rows=toRows(b.data);
+  return {
+    title: b.title || 'Sheet',
+    rows,
+    columns: buildColumns(rows),
+    sort: {key:null, dir:1},
+    filterText: elQ.value||''
+  };
+});
+
+elStatus.textContent = `인식한 시트 ${sheets.length}개: ` + sheets.map(s=>s.title).join(', ');
+active=0;
+buildTabs();
+renderActive();
+
+
+    if (!blocks||!blocks.length){ elStatus.textContent='오류: 입력 파싱 실패 (JSON 또는 섹션형 포맷)'; return; }
+
+    sheets = blocks.map(b=>{
+      const rows=toRows(b.data);
+      return { title:b.title||'Sheet', rows, columns:buildColumns(rows), sort:{key:null,dir:1}, filterText: elQ.value||'' };
+    });
+    active=0;
+    buildTabs();
+    renderActive();
+  }
+
+  function clearAll(){
+    elIn.value=''; elQ.value=''; elStatus.textContent='';
+    elTblHead.innerHTML=''; elTblBody.innerHTML='';
+    sheets=[]; active=0; buildTabs();
+    if (elTs) elTs.textContent='';
+  }
+
+  function csvExport(){
+    if(!sheets.length) return;
+    const S=sheets[active];
+    const q=(S.filterText||'').trim().toLowerCase();
+    const viewRows = q ? S.rows.filter(r=>JSON.stringify(r).toLowerCase().includes(q)) : S.rows.slice();
+
+    const sums={}; S.columns.forEach(c=>sums[c]=0);
+    viewRows.forEach(r=>{
+      S.columns.forEach(col=>{
+        const v=r[col];
+        if(!isDateColumn(col)&&isNumeric(v)&&!RATE_HINTS.some(h=>(col||'').includes(h))) sums[col]+=Number(v);
+      });
+    });
+
+    const esc=s=>{ if(s==null) return ''; s=String(s); return (s.includes('"')||s.includes(',')||s.includes('\n'))? '"'+s.replace(/"/g,'""')+'"' : s; };
+    const header=['', ...S.columns].map(esc).join(',');
+    const lines=viewRows.map(r=>['', ...S.columns.map(c=>esc(formatForDisplay(c,r[c])) )].join(','));
+    const total=['합계', ...S.columns.map(col=>{ const v=sums[col]; return (isFinite(v)&&v!==0)? esc(v.toLocaleString('ko-KR')): ''; })].join(',');
+
+    const csv=[header, ...lines, total].join('\n');
+    const blob=new Blob(["\uFEFF"+csv], {type:'text/csv;charset=utf-8;'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=(shortTitle(S.title)||'sheet')+'.csv'; a.click();
+  }
+
+  // 이벤트
+  document.getElementById('btnConvert').addEventListener('click', convert);
+  document.getElementById('btnSample').addEventListener('click', ()=>{
+    elIn.value = `업체A --------------------------------------------
+[
+  {
+    "com_sales_dt": "202507",
+    "com_tax_amount": "19000",
+    "com_free_amount": "0",
+    "com_etc_tax": "19000",
+    "com_etc_free": "0",
+    "부가세상세": { "배송완료": { "과세": { "현금": { "상품주문액": "0" }}}}
+  }
+]
+업체B --------------------------------------------
+[ { "com_sales_dt": "202509", "com_tax_amount": "800000" } ]
+업체C --------------------------------------------
+[ { "com_sales_dt": "202508", "com_tax_amount": "70000" } ]`;
+  });
+  document.getElementById('btnClear').addEventListener('click', clearAll);
+  document.getElementById('btnCsv').addEventListener('click', csvExport);
+  elQ.addEventListener('input',(e)=>{ if(!sheets.length) return; sheets[active].filterText=e.target.value||''; renderActive(); });
+})();
+</script>
+</body>
+</html>
